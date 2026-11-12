@@ -11,6 +11,11 @@
 //!   [`CACHE_TTL`]; callers run a check on an explicit user action or at most
 //!   once per session.
 //! * The comparison is *semantic*, so `0.2.0` correctly beats `0.10.0`.
+//! * **No verification, no install** — this crate only reads release metadata.
+//!   It never downloads, hashes or cryptographically verifies an artefact, and
+//!   Lintel never installs an update: the user downloads from the release page
+//!   and verifies the file against `SHA256SUMS.txt` / `SHA256SUMS.txt.asc`
+//!   themselves (see `docs/release-verification.md`).
 //!
 //! The crate is deliberately UI-free: an app runs [`UpdateChecker::check`] on a
 //! worker thread and posts the resulting [`UpdateStatus`] back to its UI loop.
@@ -30,6 +35,12 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `User-Agent` sent with every request (the GitHub API requires one).
 pub const USER_AGENT: &str = "lintel-update-check";
+
+/// File name of the checksum manifest Lintel releases publish.
+const SHA256SUMS_ASSET: &str = "SHA256SUMS.txt";
+
+/// File name of the detached PGP signature over [`SHA256SUMS_ASSET`].
+const SHA256SUMS_SIGNATURE_ASSET: &str = "SHA256SUMS.txt.asc";
 
 /// Outcome of a check. `Unknown` covers every failure mode so the UI can show a
 /// single honest "couldn't check" state instead of a stack of error variants.
@@ -76,6 +87,67 @@ pub struct Release {
     /// GitHub pre-release flag; pre-releases are never offered to the user.
     #[serde(default)]
     pub prerelease: bool,
+    /// Files attached to the release (installers, checksum manifests…).
+    ///
+    /// Absent for a payload that carries no assets; the UI shows nothing extra
+    /// in that case rather than a dead control.
+    #[serde(default)]
+    pub assets: Vec<ReleaseAsset>,
+}
+
+impl Release {
+    /// The release's `SHA256SUMS.txt` asset, when the release publishes one.
+    ///
+    /// Matching is an exact file-name comparison: a differently named manifest
+    /// is not this release's canonical checksum list.
+    pub fn checksum_asset(&self) -> Option<&ReleaseAsset> {
+        self.assets.iter().find(|a| a.name == SHA256SUMS_ASSET)
+    }
+
+    /// The release's detached signature for the checksum manifest
+    /// (`SHA256SUMS.txt.asc`), when present.
+    ///
+    /// This crate never checks the signature itself; the asset is surfaced only
+    /// so the user knows what to verify against.
+    pub fn signature_asset(&self) -> Option<&ReleaseAsset> {
+        self.assets
+            .iter()
+            .find(|a| a.name == SHA256SUMS_SIGNATURE_ASSET)
+    }
+}
+
+/// One downloadable file attached to a release, as far as this crate cares.
+///
+/// Fields map onto the GitHub Releases payload: `download_url` ←
+/// `browser_download_url` and `digest` ← `digest`. GitHub publishes the digest
+/// it computed when hashing an asset (for example `sha256:<hex>`), but the
+/// field may be absent, so parsing never depends on it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ReleaseAsset {
+    /// File name of the asset (e.g. `SHA256SUMS.txt`).
+    #[serde(default)]
+    pub name: String,
+    /// Browser URL that downloads the asset.
+    #[serde(rename = "browser_download_url", default)]
+    pub download_url: String,
+    /// Algorithm-prefixed digest (`sha256:<hex>`) when GitHub provides one.
+    #[serde(default)]
+    pub digest: Option<String>,
+}
+
+impl ReleaseAsset {
+    /// The lowercase hex SHA-256 of the asset, when GitHub published one.
+    ///
+    /// Returns `None` for a missing digest or for a digest using another
+    /// algorithm (`sha512:…`), so a caller can never mistake an unsupported or
+    /// absent hash for a verified one.
+    pub fn sha256(&self) -> Option<&str> {
+        let (algorithm, hex) = self.digest.as_deref()?.split_once(':')?;
+        if algorithm != "sha256" || hex.is_empty() {
+            return None;
+        }
+        Some(hex)
+    }
 }
 
 /// Parsed semantic version (major.minor.patch, optional pre-release suffix).
@@ -259,6 +331,15 @@ mod tests {
             published_at: None,
             draft: false,
             prerelease: false,
+            assets: Vec::new(),
+        }
+    }
+
+    fn asset(name: &str, digest: Option<&str>) -> ReleaseAsset {
+        ReleaseAsset {
+            name: name.to_string(),
+            download_url: format!("https://example.com/{name}"),
+            digest: digest.map(str::to_string),
         }
     }
 
@@ -361,6 +442,68 @@ mod tests {
         assert_eq!(release.name, None);
         assert!(!release.draft);
         assert!(!release.prerelease);
+        assert!(release.assets.is_empty());
+    }
+
+    #[test]
+    fn release_payload_with_assets_finds_checksum_and_signature() {
+        let json = r#"{
+            "tag_name": "v0.3.0",
+            "html_url": "https://github.com/x/y/releases/tag/v0.3.0",
+            "body": "Notes here",
+            "assets": [
+                {
+                    "name": "SHA256SUMS.txt",
+                    "browser_download_url": "https://example.com/SHA256SUMS.txt",
+                    "digest": "sha256:abc123"
+                },
+                {
+                    "name": "SHA256SUMS.txt.asc",
+                    "browser_download_url": "https://example.com/SHA256SUMS.txt.asc"
+                }
+            ]
+        }"#;
+        let release: Release = serde_json::from_str(json).expect("deserialise");
+        assert_eq!(release.assets.len(), 2);
+        let checksum = release.checksum_asset().expect("checksum asset");
+        assert_eq!(checksum.name, "SHA256SUMS.txt");
+        assert_eq!(checksum.download_url, "https://example.com/SHA256SUMS.txt");
+        assert_eq!(checksum.sha256(), Some("abc123"));
+        let signature = release.signature_asset().expect("signature asset");
+        assert_eq!(signature.name, "SHA256SUMS.txt.asc");
+        assert_eq!(signature.digest, None);
+        // A signature file is not the checksum manifest, even though its name
+        // starts with it.
+        assert_eq!(release.checksum_asset().map(|a| a.name.as_str()), Some("SHA256SUMS.txt"));
+    }
+
+    #[test]
+    fn release_payload_without_assets_defaults_to_empty() {
+        let release: Release =
+            serde_json::from_str(r#"{"tag_name": "v0.3.0"}"#).expect("deserialise");
+        assert!(release.assets.is_empty());
+        assert!(release.checksum_asset().is_none());
+        assert!(release.signature_asset().is_none());
+    }
+
+    #[test]
+    fn asset_sha256_extracts_hex_and_rejects_other_algorithms() {
+        assert_eq!(asset("SHA256SUMS.txt", Some("sha256:abc123")).sha256(), Some("abc123"));
+        assert_eq!(asset("SHA256SUMS.txt", Some("sha512:deadbeef")).sha256(), None);
+        assert_eq!(asset("SHA256SUMS.txt", Some("abc123")).sha256(), None);
+        assert_eq!(asset("SHA256SUMS.txt", Some("sha256:")).sha256(), None);
+        assert_eq!(asset("SHA256SUMS.txt", None).sha256(), None);
+    }
+
+    #[test]
+    fn checksum_asset_is_none_when_the_release_publishes_none() {
+        let mut release = rel("v0.3.0");
+        release
+            .assets
+            .push(asset("lintel-0.3.0.AppImage", Some("sha256:abc123")));
+        release.assets.push(asset("SHA256SUMS.txt.sig", None));
+        assert!(release.checksum_asset().is_none());
+        assert!(release.signature_asset().is_none());
     }
 
     #[test]
