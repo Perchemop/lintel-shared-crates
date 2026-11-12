@@ -474,7 +474,10 @@ mod tests {
         assert_eq!(signature.digest, None);
         // A signature file is not the checksum manifest, even though its name
         // starts with it.
-        assert_eq!(release.checksum_asset().map(|a| a.name.as_str()), Some("SHA256SUMS.txt"));
+        assert_eq!(
+            release.checksum_asset().map(|a| a.name.as_str()),
+            Some("SHA256SUMS.txt")
+        );
     }
 
     #[test]
@@ -488,8 +491,14 @@ mod tests {
 
     #[test]
     fn asset_sha256_extracts_hex_and_rejects_other_algorithms() {
-        assert_eq!(asset("SHA256SUMS.txt", Some("sha256:abc123")).sha256(), Some("abc123"));
-        assert_eq!(asset("SHA256SUMS.txt", Some("sha512:deadbeef")).sha256(), None);
+        assert_eq!(
+            asset("SHA256SUMS.txt", Some("sha256:abc123")).sha256(),
+            Some("abc123")
+        );
+        assert_eq!(
+            asset("SHA256SUMS.txt", Some("sha512:deadbeef")).sha256(),
+            None
+        );
         assert_eq!(asset("SHA256SUMS.txt", Some("abc123")).sha256(), None);
         assert_eq!(asset("SHA256SUMS.txt", Some("sha256:")).sha256(), None);
         assert_eq!(asset("SHA256SUMS.txt", None).sha256(), None);
