@@ -16,6 +16,10 @@
 //!   Lintel never installs an update: the user downloads from the release page
 //!   and verifies the file against `SHA256SUMS.txt` / `SHA256SUMS.txt.asc`
 //!   themselves (see `docs/release-verification.md`).
+//! * **Signature verification support** — when the `release-signing-key` feature
+//!   is enabled, [`verify_signature`] provides deterministic verification of the
+//!   GPG detached signature over `SHA256SUMS.txt`. The public key is bundled at
+//!   compile time via `include_str!`.
 //!
 //! The crate is deliberately UI-free: an app runs [`UpdateChecker::check`] on a
 //! worker thread and posts the resulting [`UpdateStatus`] back to its UI loop.
@@ -106,13 +110,32 @@ impl Release {
 
     /// The release's detached signature for the checksum manifest
     /// (`SHA256SUMS.txt.asc`), when present.
-    ///
-    /// This crate never checks the signature itself; the asset is surfaced only
-    /// so the user knows what to verify against.
     pub fn signature_asset(&self) -> Option<&ReleaseAsset> {
         self.assets
             .iter()
             .find(|a| a.name == SHA256SUMS_SIGNATURE_ASSET)
+    }
+
+    /// The release's public key fingerprint (first 16 hex chars), for display.
+    ///
+    /// This is extracted from the release notes body, which should contain
+    /// a line like "Signing key: ABCDEF1234567890" or be parsed from the
+    /// signature verification result.
+    pub fn signature_fingerprint(&self) -> Option<String> {
+        // Look for a fingerprinting pattern in release notes
+        // Common formats: "Signing key: XXX" or "Key fingerprint: XXX"
+        self.notes
+            .lines()
+            .find(|l| l.to_lowercase().contains("key fingerprint"))
+            .and_then(|l| {
+                // Extract the hex key from the line
+                l.split_whitespace()
+                    .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_hexdigit()))
+                    .map(|w| {
+                        // Return first 16 chars of the hex key
+                        w.chars().take(16).collect::<String>()
+                    })
+            })
     }
 }
 
@@ -316,6 +339,145 @@ pub fn pick_latest(releases: &[Release]) -> Option<Release> {
         .filter_map(|release| Version::parse(&release.tag).map(|version| (version, release)))
         .max_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, release)| release.clone())
+}
+
+/// Result of verifying a signature over a checksum manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignatureVerification {
+    /// The signature is valid and signed by the expected release key.
+    Valid {
+        /// The signature algorithm used (e.g., "OpenPGP").
+        algo: String,
+        /// The key fingerprint (first 16 hex chars).
+        fingerprint: String,
+    },
+    /// The release does not publish a signature for the checksum manifest.
+    MissingSignature,
+    /// The release does not publish a checksum manifest.
+    MissingChecksum,
+    /// Verification failed (bad signature, wrong key, corrupted data).
+    Invalid {
+        /// Human-readable reason for the failure.
+        reason: String,
+    },
+}
+
+/// Bundled release signing public key (imported when feature is enabled).
+#[cfg(feature = "release-signing-key")]
+pub const RELEASE_SIGNING_KEY: &str =
+    include_str!("../../resources/lintel-release-signing-public.asc");
+
+/// Verify a GPG detached signature over SHA256SUMS.txt content.
+///
+/// This function is available when the `release-signing-key` feature is enabled.
+/// It requires the public key to be bundled at compile time.
+///
+/// # Arguments
+/// * `checksum_content` - The raw bytes of SHA256SUMS.txt
+/// * `signature_content` - The raw bytes of the detached signature (SHA256SUMS.txt.asc)
+///
+/// # Returns
+/// `SignatureVerification::Valid` on success, or a detailed error variant.
+#[cfg(feature = "release-signing-key")]
+pub fn verify_signature(
+    checksum_content: &[u8],
+    signature_content: &[u8],
+) -> SignatureVerification {
+    use std::io::Write;
+
+    // Create temporary files for verification
+    let checksum_path = std::env::temp_dir().join("lintel_checksums.txt");
+    let signature_path = std::env::temp_dir().join("lintel_signature.asc");
+    let keyring_path = std::env::temp_dir().join("lintel-keyring");
+
+    // Create a temporary GNUPGHOME directory
+    if let Err(e) = std::fs::create_dir_all(&keyring_path) {
+        return SignatureVerification::Invalid {
+            reason: format!("Failed to create keyring directory: {e}"),
+        };
+    }
+
+    // Write the release signing key
+    if let Err(e) = std::fs::File::create(&keyring_path.join("pubring.kbx"))
+        .and_then(|mut f| f.write_all(RELEASE_SIGNING_KEY.as_bytes()))
+    {
+        let _ = std::fs::remove_file(&checksum_path);
+        let _ = std::fs::remove_file(&signature_path);
+        let _ = std::fs::remove_dir_all(&keyring_path);
+        return SignatureVerification::Invalid {
+            reason: format!("Failed to write key file: {e}"),
+        };
+    }
+
+    // Write the checksum file
+    if let Err(e) =
+        std::fs::File::create(&checksum_path).and_then(|mut f| f.write_all(checksum_content))
+    {
+        let _ = std::fs::remove_file(&signature_path);
+        let _ = std::fs::remove_dir_all(&keyring_path);
+        return SignatureVerification::Invalid {
+            reason: format!("Failed to write checksum file: {e}"),
+        };
+    }
+
+    // Write the signature file
+    if let Err(e) =
+        std::fs::File::create(&signature_path).and_then(|mut f| f.write_all(signature_content))
+    {
+        let _ = std::fs::remove_file(&checksum_path);
+        let _ = std::fs::remove_dir_all(&keyring_path);
+        return SignatureVerification::Invalid {
+            reason: format!("Failed to write signature file: {e}"),
+        };
+    }
+
+    // Run GPG verification with the custom keyring
+    let output = std::process::Command::new("gpg")
+        .args([
+            "--verify",
+            &signature_path.to_string_lossy(),
+            &checksum_path.to_string_lossy(),
+        ])
+        .env("GNUPGHOME", &keyring_path)
+        .output();
+
+    // Clean up temp files
+    let _ = std::fs::remove_file(&checksum_path);
+    let _ = std::fs::remove_file(&signature_path);
+    let _ = std::fs::remove_dir_all(&keyring_path);
+
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            return SignatureVerification::Invalid {
+                reason: format!("GPG verification failed: {e}"),
+            };
+        }
+    };
+
+    if output.status.success() {
+        // Extract fingerprint from GPG output
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let fingerprint = stdout
+            .lines()
+            .find(|l| l.contains("Good signature"))
+            .and_then(|l| {
+                l.split("key ")
+                    .nth(1)
+                    .and_then(|k| k.split_whitespace().next())
+            })
+            .unwrap_or("unknown");
+
+        SignatureVerification::Valid {
+            algo: "OpenPGP".to_string(),
+            fingerprint: format!("{:0>16}", fingerprint),
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        SignatureVerification::Invalid {
+            reason: stderr.trim().to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
