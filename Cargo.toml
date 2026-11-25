@@ -4,9 +4,12 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "Shared update checking for the Lintel suite: GitHub Releases API, semantic version comparison, fail-soft offline."
+description = "Shared update checking for the Lintel suite: GitHub Releases API, semantic version comparison, fail-soft offline, and signature verification."
 repository = "https://github.com/Perchemop/lintel-desktop"
 readme = "../../README.md"
+
+[features]
+default = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
